@@ -34,6 +34,7 @@ class ParkingLot:
         self.road_weights = [[1.0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
         self.parking_status = {}  # (row, col): 'empty', 'reserved', 'occupied'
         self.road_occupancy = {}  # (row, col): car_id or None
+        self.road_reservations = {}  # (row, col): car_id or None - prevents multiple cars targeting same segment
         self.initialize_grid()
         
     def initialize_grid(self):
@@ -64,18 +65,41 @@ class ParkingLot:
                             self.parking_status[(row, col)] = 'empty'
     
     def is_road_occupied(self, pos):
-        """Check if a road segment is occupied by another car"""
-        return self.road_occupancy.get(pos) is not None
+        """Check if a road segment is occupied or reserved by another car"""
+        return self.road_occupancy.get(pos) is not None or self.road_reservations.get(pos) is not None
+    
+    def is_road_occupied_by_other(self, pos, car_id):
+        """Check if a road segment is occupied or reserved by a different car"""
+        occupant = self.road_occupancy.get(pos)
+        reserver = self.road_reservations.get(pos)
+        return (occupant is not None and occupant != car_id) or (reserver is not None and reserver != car_id)
     
     def occupy_road(self, pos, car_id):
         """Mark a road segment as occupied by a car"""
         if self.grid[pos[0]][pos[1]] == 'road':
             self.road_occupancy[pos] = car_id
+            # Clear reservation when actually occupying
+            if pos in self.road_reservations and self.road_reservations[pos] == car_id:
+                self.road_reservations[pos] = None
     
     def free_road(self, pos):
         """Free a road segment"""
         if pos in self.road_occupancy:
             self.road_occupancy[pos] = None
+    
+    def reserve_road(self, pos, car_id):
+        """Reserve a road segment for a car to prevent conflicts"""
+        if self.grid[pos[0]][pos[1]] == 'road':
+            # Only reserve if not already occupied or reserved by another car
+            if not self.is_road_occupied_by_other(pos, car_id):
+                self.road_reservations[pos] = car_id
+                return True
+        return False
+    
+    def free_road_reservation(self, pos, car_id):
+        """Free a road segment reservation"""
+        if pos in self.road_reservations and self.road_reservations[pos] == car_id:
+            self.road_reservations[pos] = None
     
     def get_neighbors(self, pos):
         """Get valid neighboring road segments"""
@@ -216,11 +240,13 @@ class Car:
         self.original_path = None
         self.original_destination = None
         
-        # Occupy initial position
+        # Occupy initial position and reserve next segment
         if self.path and len(self.path) > 0:
             self.parking_lot.occupy_road(self.position, self.id)
             if len(self.path) > 1:
                 self.target_segment = self.path[1]
+                # Reserve the next segment to prevent other cars from targeting it
+                self.parking_lot.reserve_road(self.target_segment, self.id)
         
     def update(self):
         """Update car position with smooth movement"""
@@ -234,9 +260,11 @@ class Car:
         if self.state == 'waiting':
             self.waiting_timer += 1
             # Check if target segment is now free
-            if self.target_segment and not self.parking_lot.is_road_occupied(self.target_segment):
-                self.state = 'entering' if not self.is_exiting else 'exiting'
-                self.waiting_timer = 0
+            if self.target_segment and not self.parking_lot.is_road_occupied_by_other(self.target_segment, self.id):
+                # Try to reserve the segment
+                if self.parking_lot.reserve_road(self.target_segment, self.id):
+                    self.state = 'entering' if not self.is_exiting else 'exiting'
+                    self.waiting_timer = 0
             return
         
         # Calculate target visual position
@@ -267,13 +295,14 @@ class Car:
                 if self.current_path_index < len(self.path):
                     self.target_segment = self.path[self.current_path_index]
                     
-                    # Check if next segment is occupied
-                    if self.parking_lot.is_road_occupied(self.target_segment):
+                    # Check if next segment is occupied or reserved by another car
+                    if self.parking_lot.is_road_occupied_by_other(self.target_segment, self.id):
                         self.state = 'waiting'
                         self.parking_lot.occupy_road(self.position, self.id)
                         self.parking_lot.increment_segment(self.position, 10.5 if not self.in_deadlock else 21)
                     else:
-                        # Occupy current segment
+                        # Reserve next segment and occupy current segment
+                        self.parking_lot.reserve_road(self.target_segment, self.id)
                         self.parking_lot.occupy_road(self.position, self.id)
                         self.parking_lot.increment_segment(self.position, 10.5 if not self.in_deadlock else 21)
                 else:
@@ -290,6 +319,11 @@ class Car:
     
     def reach_destination(self):
         """Handle reaching the destination"""
+        # Clean up any remaining reservations
+        if self.target_segment:
+            self.parking_lot.free_road_reservation(self.target_segment, self.id)
+            self.target_segment = None
+        
         if self.is_exiting:
             # Car exits the lot
             self.state = 'exited'
@@ -339,9 +373,11 @@ class Car:
             # Reserve path
             self.parking_lot.update_path_weights(best_path, 1.5)
             
-            # Occupy first segment
+            # Occupy first segment and reserve next
             self.parking_lot.occupy_road(self.position, self.id)
             self.parking_lot.increment_segment(self.position, 10.5)
+            if self.target_segment:
+                self.parking_lot.reserve_road(self.target_segment, self.id)
 
 
 class Simulation:
@@ -371,17 +407,22 @@ class Simulation:
         if not empty_spaces:
             return
         
-        # Choose random entry point from fixed entry points
-        entry_point = random.choice(ENTRY_POINTS)
-        
-        # Check if entry point is occupied
-        if self.parking_lot.is_road_occupied(entry_point):
+        # Try each entry point until we find an available one
+        available_entries = [ep for ep in ENTRY_POINTS if not self.parking_lot.is_road_occupied(ep)]
+        if not available_entries:
             return
+        
+        # Choose random entry point from available entry points
+        entry_point = random.choice(available_entries)
         
         # Find shortest path to parking
         path, parking_spot, cost = self.parking_lot.find_shortest_path_to_parking(entry_point)
         
         if path and parking_spot:
+            # Verify the first segment of the path is available
+            if len(path) > 1 and self.parking_lot.is_road_occupied(path[1]):
+                return
+            
             # Reserve the parking spot
             self.parking_lot.reserve_parking(parking_spot)
             
@@ -460,9 +501,13 @@ class Simulation:
             car.original_path = car.path.copy()
             car.original_destination = car.destination
             
-            # Release old path weights
+            # Release old path weights and reservations
             remaining_path = car.path[car.current_path_index:]
             self.parking_lot.release_path_weights(remaining_path, 1.5)
+            
+            # Clear any existing target segment reservation
+            if car.target_segment:
+                self.parking_lot.free_road_reservation(car.target_segment, car.id)
             
             # Find new destination
             if car.is_exiting:
@@ -491,6 +536,10 @@ class Simulation:
                     
                     # Reserve new path with higher weight
                     self.parking_lot.update_path_weights(best_path, 3)
+                    
+                    # Reserve next segment
+                    if car.target_segment:
+                        self.parking_lot.reserve_road(car.target_segment, car.id)
             else:
                 # Find next closest empty parking
                 best_path = None
@@ -516,6 +565,10 @@ class Simulation:
                     # Reserve new parking and path
                     self.parking_lot.reserve_parking(parking_spot)
                     self.parking_lot.update_path_weights(path, 3)
+                    
+                    # Reserve next segment
+                    if car.target_segment:
+                        self.parking_lot.reserve_road(car.target_segment, car.id)
             
             # Only reroute one car at a time for simplicity
             self.total_deadlocks_resolved += 1
